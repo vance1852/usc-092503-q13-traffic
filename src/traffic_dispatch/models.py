@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from .clock import parse_utc
 from .errors import ValidationFailed
+from .planning import canonical_decimal_text
 
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
@@ -220,6 +221,18 @@ class DispatchRequest:
             priority=priority,
             idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
         )
+
+    def canonical_payload(self) -> dict[str, Any]:
+        """业务校验后的规范化请求：幂等摘要、入库与审计统一以它为准。"""
+        return {
+            "dispatch_id": self.dispatch_id,
+            "corridor_id": self.corridor_id,
+            "incident_id": self.incident_id,
+            "duty_date": self.duty_date,
+            "requested_units": canonical_decimal_text(self.requested_units),
+            "priority": self.priority,
+            "idempotency_key": self.idempotency_key,
+        }
 
 
 @dataclass(frozen=True, slots=True)

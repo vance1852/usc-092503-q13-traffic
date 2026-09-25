@@ -26,6 +26,14 @@ def decimal_text(value: Decimal) -> str:
     return format(value, "f")
 
 
+def canonical_decimal_text(value: Decimal) -> str:
+    """十进制数值的规范文本：去掉小数末尾的零，使 `1`、`1.0`、`"1.00"` 等等价写法一致。"""
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return "0" if text in {"-0", ""} else text
+
+
 def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

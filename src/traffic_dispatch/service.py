@@ -16,6 +16,7 @@ from .planning import (
     AllocationRequest,
     RiskPoint,
     allocate_capacity,
+    canonical_decimal_text,
     canonical_json,
     decimal_text,
     delivered_after_loss,
@@ -300,7 +301,8 @@ class TrafficDispatchService:
     def submit_dispatch(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "dispatch_request.write")
         dispatch_request = DispatchRequest.from_dict(raw)
-        request_digest = digest(raw)
+        normalized = dispatch_request.canonical_payload()
+        request_digest = digest(normalized)
         stored = self.connection.execute(
             "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='dispatch_request' AND idempotency_key=?",
             (dispatch_request.idempotency_key,),
@@ -328,7 +330,7 @@ class TrafficDispatchService:
                         dispatch_request.corridor_id,
                         dispatch_request.incident_id,
                         dispatch_request.duty_date,
-                        decimal_text(dispatch_request.requested_units),
+                        canonical_decimal_text(dispatch_request.requested_units),
                         dispatch_request.priority,
                         dispatch_request.idempotency_key,
                         actor_id,
@@ -340,7 +342,7 @@ class TrafficDispatchService:
                     "VALUES('dispatch_request',?,?,?,?)",
                     (dispatch_request.idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
-                self._audit("dispatch_request", dispatch_request.dispatch_id, "dispatch_request.submitted", actor_id, raw)
+                self._audit("dispatch_request", dispatch_request.dispatch_id, "dispatch_request.submitted", actor_id, normalized)
         except sqlite3.IntegrityError as exc:
             raise Conflict("调度申请编号或幂等键冲突") from exc
         return response
