@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from traffic_dispatch.api import JsonApplication
 from traffic_dispatch.clock import FrozenClock
 from traffic_dispatch.errors import Conflict, Forbidden
-from traffic_dispatch.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak
+from traffic_dispatch.planning import AllocationRequest, RiskPoint, allocate_capacity, digest, latest_streak
 from traffic_dispatch.service import TrafficDispatchService
+from traffic_dispatch.storage import connect
 from traffic_dispatch.risk import DemandBucket, inventory_coverage, mark_to_risk, traffic_gap
 
 
@@ -92,6 +95,90 @@ class TrafficDispatchServiceTests(unittest.TestCase):
         changed = dict(payload, requested_units="81000")
         with self.assertRaises(Conflict):
             self.service.submit_dispatch("dispatch", changed)
+
+    def test_dispatch_idempotency_normalizes_equivalent_payloads(self) -> None:
+        base = {"dispatch_id": "nom-1", "corridor_id": "corridor-east-1", "incident_id": "medical-center", "duty_date": "2026-09-25", "requested_units": 1, "priority": 10, "idempotency_key": "key-1"}
+        first = self.service.submit_dispatch("dispatch", base)
+        equivalents = [
+            dict(base, requested_units=1.0),
+            dict(base, requested_units="1.00"),
+            dict(base, corridor_id="  corridor-east-1  ", incident_id="medical-center  ", duty_date=" 2026-09-25"),
+            dict(base, requested_units="1", client_note="协议外字段"),
+        ]
+        for variant in equivalents:
+            self.assertEqual(first, self.service.submit_dispatch("dispatch", variant))
+        rows = self.connection.execute("SELECT * FROM dispatch_requests").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["requested_units"], "1")
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) AS c FROM traffic_idempotency").fetchone()["c"],
+            1,
+        )
+        defaulted = {"dispatch_id": "nom-2", "corridor_id": "corridor-east-1", "incident_id": "medical-center", "duty_date": "2026-09-25", "requested_units": "5", "idempotency_key": "key-2"}
+        omitted = self.service.submit_dispatch("dispatch", defaulted)
+        explicit = self.service.submit_dispatch("dispatch", dict(defaulted, priority=100))
+        self.assertEqual(omitted, explicit)
+
+    def test_dispatch_idempotency_conflicts_on_real_changes(self) -> None:
+        base = {"dispatch_id": "nom-1", "corridor_id": "corridor-east-1", "incident_id": "medical-center", "duty_date": "2026-09-25", "requested_units": 1, "priority": 10, "idempotency_key": "key-1"}
+        self.service.submit_dispatch("dispatch", base)
+        changes = [
+            {"incident_id": "other-incident"},
+            {"corridor_id": "corridor-east-2"},
+            {"duty_date": "2026-09-26"},
+            {"requested_units": "1.001"},
+            {"requested_units": 2},
+            {"priority": 11},
+            {"dispatch_id": "nom-2"},
+        ]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(Conflict):
+                self.service.submit_dispatch("dispatch", dict(base, **change))
+
+    def test_dispatch_response_replays_after_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "traffic.sqlite3"
+            clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
+            connection = connect(path)
+            service = TrafficDispatchService(connection, clock)
+            service.create_user("plan", "plan", "planner")
+            service.create_user("dispatch", "dispatch", "dispatcher")
+            service.create_facility("plan", {"center_id": "center-east", "name": "北部事故快处中心", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_units": "500000"})
+            service.create_facility("plan", {"center_id": "command-center-b", "name": "沿海终端", "kind": "command-center", "timezone": "Asia/Shanghai", "capacity_units": "800000"})
+            service.create_route("plan", {"corridor_id": "corridor-east-1", "origin_center_id": "center-east", "destination_center_id": "command-center-b", "response_resource_kind": "patrol-unit", "hourly_capacity": "100000", "delay_basis_points": 25, "response_minutes": 36})
+            payload = {"dispatch_id": "nom-1", "corridor_id": "corridor-east-1", "incident_id": "medical-center", "duty_date": "2026-09-25", "requested_units": 1.0, "priority": 10, "idempotency_key": "key-1"}
+            first = service.submit_dispatch("dispatch", payload)
+            connection.close()
+
+            reopened = connect(path)
+            try:
+                replayed = TrafficDispatchService(reopened, clock).submit_dispatch("dispatch", dict(payload, requested_units=1))
+                self.assertEqual(first, replayed)
+                self.assertEqual(reopened.execute("SELECT count(*) AS c FROM dispatch_requests").fetchone()["c"], 1)
+            finally:
+                reopened.close()
+
+    def test_dispatch_audit_records_normalized_payload(self) -> None:
+        payload = {"dispatch_id": "nom-1", "corridor_id": " corridor-east-1 ", "incident_id": "medical-center", "duty_date": "2026-09-25", "requested_units": 1.0, "priority": 10, "idempotency_key": "key-1"}
+        self.service.submit_dispatch("dispatch", payload)
+        row = self.connection.execute(
+            "SELECT payload_json FROM traffic_audit_events WHERE event_type='dispatch_request.submitted'"
+        ).fetchone()
+        audited = json.loads(row["payload_json"])
+        self.assertEqual(audited, {
+            "dispatch_id": "nom-1",
+            "corridor_id": "corridor-east-1",
+            "incident_id": "medical-center",
+            "duty_date": "2026-09-25",
+            "requested_units": "1",
+            "priority": 10,
+            "idempotency_key": "key-1",
+        })
+        stored = self.connection.execute(
+            "SELECT request_sha256 FROM traffic_idempotency WHERE scope='dispatch_request' AND idempotency_key='key-1'"
+        ).fetchone()
+        self.assertEqual(stored["request_sha256"], digest(audited))
+        self.assertTrue(self.service.audit_chain("audit")["valid"])
 
     def test_outage_reduces_allocation_and_deployment_consumes_inventory(self) -> None:
         self.service.announce_restriction("risk", "corridor-east-1", "2026-09-25T00:00:00Z", "2026-09-25T23:59:59Z", "50", "检修")

@@ -26,6 +26,14 @@ def decimal_text(value: Decimal) -> str:
     return format(value, "f")
 
 
+def canonical_decimal_text(value: Decimal) -> str:
+    """数值的规范文本：1、1.0、1.00 等同一数值得到同一文本，不同数值仍然可区分。"""
+    normalized = value.normalize()
+    if normalized == ZERO:
+        normalized = abs(normalized)
+    return format(normalized, "f")
+
+
 def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

@@ -297,14 +297,18 @@ class TrafficDispatchService:
         ).fetchall()
         return {"center_id": center_id, "response_resource_kind": response_resource_kind, **weighted_inventory_cost(rows)}
 
+    def _stored_dispatch_response(self, idempotency_key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='dispatch_request' AND idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+
     def submit_dispatch(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "dispatch_request.write")
         dispatch_request = DispatchRequest.from_dict(raw)
-        request_digest = digest(raw)
-        stored = self.connection.execute(
-            "SELECT request_sha256,response_json FROM traffic_idempotency WHERE scope='dispatch_request' AND idempotency_key=?",
-            (dispatch_request.idempotency_key,),
-        ).fetchone()
+        canonical = dispatch_request.canonical_payload()
+        request_digest = digest(canonical)
+        stored = self._stored_dispatch_response(dispatch_request.idempotency_key)
         if stored is not None:
             if stored["request_sha256"] != request_digest:
                 raise Conflict("幂等键对应不同调度申请内容")
@@ -328,7 +332,7 @@ class TrafficDispatchService:
                         dispatch_request.corridor_id,
                         dispatch_request.incident_id,
                         dispatch_request.duty_date,
-                        decimal_text(dispatch_request.requested_units),
+                        canonical["requested_units"],
                         dispatch_request.priority,
                         dispatch_request.idempotency_key,
                         actor_id,
@@ -340,8 +344,13 @@ class TrafficDispatchService:
                     "VALUES('dispatch_request',?,?,?,?)",
                     (dispatch_request.idempotency_key, request_digest, canonical_json(response), self._now()),
                 )
-                self._audit("dispatch_request", dispatch_request.dispatch_id, "dispatch_request.submitted", actor_id, raw)
+                self._audit("dispatch_request", dispatch_request.dispatch_id, "dispatch_request.submitted", actor_id, canonical)
         except sqlite3.IntegrityError as exc:
+            stored = self._stored_dispatch_response(dispatch_request.idempotency_key)
+            if stored is not None:
+                if stored["request_sha256"] == request_digest:
+                    return json.loads(stored["response_json"])
+                raise Conflict("幂等键对应不同调度申请内容") from exc
             raise Conflict("调度申请编号或幂等键冲突") from exc
         return response
 
